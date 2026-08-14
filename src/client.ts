@@ -15,7 +15,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import { createElement, useEffect, useState } from 'react'
 
 export const name = 'workflow-groups-client'
-export const inject = ['slots', 'timer']
+export const inject = ['slots']
 
 const API_PREFIX = '/api/workflow-groups'
 
@@ -75,7 +75,9 @@ export function apply(ctx: ClientContext): void {
   tag.textContent = css
   tag.setAttribute('data-dsh-workflow-groups', '')
   document.head.appendChild(tag)
-  ctx.effect(() => { tag.remove() })
+  // ctx.effect(callback) runs callback now and treats its RETURN as the
+  // disposer — so wrap the removal in a thunk.
+  ctx.effect(() => () => { tag.remove() })
 
   const timeStr = (t: number | null | undefined) => {
     if (!t) return ''
@@ -150,6 +152,15 @@ export function apply(ctx: ClientContext): void {
       const [groups, setGroups] = useState<any[] | null>(null)
       const [updated, setUpdated] = useState<Date | null>(null)
       const [err, setErr] = useState<string | null>(null)
+      const [fatal, setFatal] = useState<string | null>(null)
+      // surface any render-time crash instead of a blank view
+      useEffect(() => {
+        const onErr = (e: ErrorEvent) => {
+          setFatal(String(e.message || e.error))
+        }
+        window.addEventListener('error', onErr)
+        return () => window.removeEventListener('error', onErr)
+      }, [])
       const load = () => {
         fetchList().then((d) => { setGroups(d.groups || []); setUpdated(new Date()); setErr(null) })
           .catch((e) => setErr(String((e && e.message) || e)))
@@ -162,8 +173,8 @@ export function apply(ctx: ClientContext): void {
             .catch((e) => { if (alive) setErr(String((e && e.message) || e)) })
         }
         tick()
-        const stop = ctx.interval(tick, 2000)
-        return () => { alive = false; stop() }
+        const handle = window.setInterval(tick, 2000)
+        return () => { alive = false; window.clearInterval(handle) }
       }, [])
       const children: any[] = []
       const headKids: any[] = [createElement('span', null, '工作流分组')]
@@ -171,7 +182,8 @@ export function apply(ctx: ClientContext): void {
       headKids.push(createElement('button', { className: 'wf-btn', onClick: () => load() }, '刷新'))
       headKids.push(createElement('button', { className: 'wf-btn', onClick: clearAll }, '清空'))
       children.push(createElement('div', { className: 'wf-head' }, headKids))
-      if (err) children.push(createElement('div', { className: 'wf-empty' }, '加载失败: ' + err))
+      if (fatal) children.push(createElement('div', { className: 'wf-empty' }, '渲染错误: ' + fatal))
+      else if (err) children.push(createElement('div', { className: 'wf-empty' }, '加载失败: ' + err))
       else if (!groups) children.push(createElement('div', { className: 'wf-empty' }, '加载中…'))
       else if (!groups.length) children.push(createElement('div', { className: 'wf-empty' }, '还没有分组 workflow。让 Agent 调用 workflow_new 工具创建并启动。'))
       else groups.forEach((g) => children.push(createElement(GroupPanel, { key: g.name, g })))
