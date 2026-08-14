@@ -258,12 +258,15 @@ export function apply(ctx: Context) {
       schema: {
         type: 'object',
         additionalProperties: false,
+        // DSH JSON-Schema subset requires `required` at the OBJECT level as a
+        // string array — NOT `required: true` inside each property.
         properties: {
-          id: { type: 'string', required: true },
-          group: { type: 'string', required: true },
-          name: { type: 'string', required: true },
-          status: { type: 'string', required: true },
+          id: { type: 'string' },
+          group: { type: 'string' },
+          name: { type: 'string' },
+          status: { type: 'string' },
         },
+        required: ['id', 'group', 'name', 'status'],
       },
       render: (args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
