@@ -1,20 +1,23 @@
 /**
  * dsh-workflow-groups — host half.
  *
- * Maintains an in-memory grouped registry of workflow runs, fed by the
- * `workflow/*` event stream (start / phase / log / agent-start / agent-end /
- * end). Exposes:
- *   - model tools `workflow_new` (create + start a grouped workflow, or
- *     register it when the engine is unreachable) and `workflow_groups`
- *     (read-only grouped snapshot),
+ * Builds a grouped view of workflow runs for the「工作流」board. Data source:
+ * the DSH workflow engine's persisted run directory (.dsh/workflow-runs) —
+ * read directly from disk (run.json + manifest.json + events.jsonl), so no
+ * event-stream wiring is required. Group names are persisted in
+ * ~/.dsh/dsh-workflow-groups.json (runId → group), written by `workflow_new`.
+ *
+ * Exposes:
+ *   - model tools `workflow_new` (create + start a grouped workflow via
+ *     ctx.dynamicWorkflows.startInline, or register it when the engine is
+ *     unreachable) and `workflow_groups` (read-only grouped snapshot),
  *   - HTTP JSON routes `/api/workflow-groups/list` and
  *     `/api/workflow-groups/clear` for the client half.
- *
- * The registry lives in the owning fiber, so an update/restart of this plugin
- * clears it; any new workflow run is re-captured from the event stream.
  */
 import { Context } from '@deepseek-ai/cordis'
-import type { WorkflowRunInfo, WorkflowResultInfo, WorkflowAgentInfo, WorkflowAgentEndInfo, WorkflowMeta } from '@deepseek-ai/dsh-workflow'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 export const name = 'workflow-groups'
 export const inject = ['webServer', 'tools']
@@ -36,6 +39,140 @@ interface RunEntry {
 }
 
 const API_PREFIX = '/api/workflow-groups'
+
+/** Persisted runId → group mapping (survives plugin restarts). */
+const GROUP_MAP_PATH = join(process.env.DSH_HOME ?? homedir(), '.dsh', 'dsh-workflow-groups.json')
+
+function loadGroupMap(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(GROUP_MAP_PATH, 'utf8')) as Record<string, string>
+    return typeof parsed === 'object' && parsed !== null ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveGroupMap(map: Record<string, string>): void {
+  try {
+    mkdirSync(join(process.env.DSH_HOME ?? homedir(), '.dsh'), { recursive: true })
+    writeFileSync(GROUP_MAP_PATH, JSON.stringify(map, null, 2), 'utf8')
+  } catch {
+    // mapping persistence is best-effort
+  }
+}
+
+/** Candidate run directories (the engine's default runDirectory is `.dsh/workflow-runs` relative to cwd). */
+function runDirs(): string[] {
+  const candidates = [
+    join(process.cwd(), '.dsh', 'workflow-runs'),
+    join(process.env.DSH_HOME ?? '', 'workflow-runs'),
+    join(homedir(), '.dsh', 'workflow-runs'),
+  ]
+  return [...new Set(candidates)].filter((dir) => existsSync(dir))
+}
+
+function mapStatus(status: string): string {
+  if (status === 'completed') return 'completed'
+  if (status === 'cancelled') return 'cancelled'
+  if (status === 'running' || status === 'paused') return 'running'
+  return 'error' // failed / denied / stopped
+}
+
+/** Parse one run directory into a RunEntry (or undefined when run.json is missing). */
+function parseRunDir(dir: string, groupMap: Record<string, string>): RunEntry | undefined {
+  const runPath = join(dir, 'run.json')
+  if (!existsSync(runPath)) return undefined
+  let run: any
+  try {
+    run = JSON.parse(readFileSync(runPath, 'utf8'))
+  } catch {
+    return undefined
+  }
+  const id = String(run.runId ?? '')
+  const name = String(run.workflow ?? run.displayName ?? '未命名')
+
+  let manifestDescription = ''
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+    manifestDescription = String(manifest.description ?? '')
+  } catch { /* no manifest */ }
+
+  // events.jsonl → agents + logs + phase activity
+  const agents: AgentView[] = []
+  const logs: { at: number; message: string }[] = []
+  const phaseTitles: string[] = []
+  let currentPhase: string | undefined
+  let lastAgentSeq = 0
+  try {
+    const eventsText = readFileSync(join(dir, 'events.jsonl'), 'utf8')
+    for (const line of eventsText.split('\n')) {
+      if (!line.trim()) continue
+      let ev: any
+      try { ev = JSON.parse(line) } catch { continue }
+      const at = Number(ev.time ?? Date.now())
+      const type = String(ev.type ?? '')
+      const data = (ev.data ?? {}) as any
+      if (type === 'phase-started') {
+        currentPhase = String(data.name ?? '')
+        if (!phaseTitles.includes(currentPhase)) phaseTitles.push(currentPhase)
+      } else if (type === 'phase-completed') {
+        if (data.name === currentPhase) currentPhase = undefined
+      } else if (type === 'agent-started') {
+        lastAgentSeq += 1
+        agents.push({
+          seq: lastAgentSeq,
+          label: String(data.name ?? 'agent'),
+          phase: data.phase === undefined ? undefined : String(data.phase),
+        })
+      } else if (type === 'agent-completed') {
+        const byTask = agents.find((a) => a.label === String(data.name ?? '') && !a.outcome)
+        const target = byTask ?? agents[agents.length - 1]
+        if (target) target.outcome = String(data.outcome ?? 'completed')
+      } else if (type === 'workflow-log') {
+        logs.push({ at, message: String(data.message ?? '') })
+      }
+    }
+  } catch { /* no events */ }
+
+  // phases: declared in manifest + any seen in events
+  let declaredPhases: string[] = []
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+    if (Array.isArray(manifest.phases)) declaredPhases = manifest.phases.map((p: any) => String(p))
+  } catch { /* no manifest */ }
+  const phaseNames = [...new Set([...declaredPhases, ...phaseTitles])]
+  const phases: PhaseView[] = phaseNames.map((title) => {
+    const count = agents.filter((a) => a.phase === title).length
+    const done = agents.filter((a) => a.phase === title && (a.outcome === 'completed' || a.outcome === 'failed' || a.outcome === 'stopped')).length
+    return { title, totalAgents: count, doneAgents: done, current: title === currentPhase }
+  })
+  if (phases.length === 0 && agents.length > 0) {
+    // agent events exist but no phase names — group them under a generic phase
+    phases.push({ title: 'run', totalAgents: agents.length, doneAgents: agents.filter((a) => a.outcome).length, current: false })
+  }
+
+  const result = run.result && typeof run.result === 'object'
+    ? {
+        stopReason: String(run.result.stopReason ?? 'error'),
+        error: run.result.error === undefined || run.result.error === null ? undefined : String(run.result.error),
+        agentsStarted: Number(run.result.agentsStarted ?? agents.length),
+      }
+    : undefined
+
+  return {
+    id,
+    group: groupMap[id] ?? '未分组',
+    name,
+    description: manifestDescription,
+    status: mapStatus(String(run.status ?? 'running')),
+    startedAt: Number(run.startedAt ?? Date.now()),
+    endedAt: run.endedAt === undefined || run.endedAt === null ? undefined : Number(run.endedAt),
+    phases,
+    agents,
+    logs,
+    result,
+  }
+}
 
 function json(res: any, status: number, value: unknown) {
   const body = JSON.stringify(value)
@@ -97,9 +234,9 @@ function postRoute(path: string, run: (body: any) => Promise<unknown>) {
 }
 
 export function apply(ctx: Context) {
+  // ---- in-memory registered placeholders (engine unreachable) ----
   const groups = new Map<string, { name: string; createdAt: number; runIds: string[] }>()
   const runs = new Map<string, RunEntry>()
-  const byName = new Map<string, string>()
 
   const ensureGroup = (name: string) => {
     let g = groups.get(name)
@@ -110,117 +247,58 @@ export function apply(ctx: Context) {
     return g
   }
 
-  /** If a name-keyed "registered" placeholder exists, adopt its group for the live run. */
-  const takeRegistered = (id: string, meta?: WorkflowMeta) => {
-    if (!meta?.name || !byName.has(meta.name)) return undefined
-    const priorId = byName.get(meta.name)!
-    const prior = runs.get(priorId)
-    if (prior && prior.status === 'registered' && priorId !== id) {
-      const inherited = prior.group
-      runs.delete(priorId)
-      const g = groups.get(prior.group)
-      if (g) g.runIds = g.runIds.filter((x) => x !== priorId)
-      byName.set(meta.name, id)
-      return inherited
-    }
-    return undefined
-  }
-
-  const upsertRun = (info: WorkflowRunInfo, extra?: { group?: string; name?: string; description?: string }) => {
-    const inherited = takeRegistered(info.id, info.meta)
-    let e = runs.get(info.id)
+  const upsertRun = (id: string, group: string, entry: Omit<RunEntry, 'id' | 'group'>) => {
+    let e = runs.get(id)
     if (!e) {
-      const declared = Array.isArray(info.meta?.phases) ? info.meta!.phases! : []
-      e = {
-        id: info.id,
-        group: inherited ?? '未分组',
-        name: info.meta?.name ?? '未命名',
-        description: info.meta?.description ?? '',
-        status: 'running',
-        phases: declared.map((p) => ({ title: p.title, detail: p.detail, totalAgents: 0, doneAgents: 0, current: false })),
-        agents: [],
-        logs: [],
-        startedAt: Date.now(),
-      }
-      runs.set(info.id, e)
-      if (info.meta?.name) byName.set(info.meta.name, info.id)
+      e = { id, group, ...entry }
+      runs.set(id, e)
     }
-    if (extra?.group && e.group !== extra.group) {
-      const old = groups.get(e.group)
-      if (old) old.runIds = old.runIds.filter((id) => id !== info.id)
-      e.group = extra.group
-    }
-    if (extra?.name) e.name = extra.name
-    if (extra?.description) e.description = extra.description
-    const g = ensureGroup(e.group)
-    if (!g.runIds.includes(e.id)) g.runIds.push(e.id)
     return e
   }
 
-  // ---- workflow event stream -> registry ----
-  ctx.on('workflow/start', (info: WorkflowRunInfo) => { upsertRun(info) })
-  ctx.on('workflow/phase', (info: WorkflowRunInfo, title: string) => {
-    const e = upsertRun(info)
-    let p = e.phases.find((x) => x.title === title)
-    if (!p) {
-      p = { title, totalAgents: 0, doneAgents: 0, current: true }
-      e.phases.push(p)
-    }
-    e.phases.forEach((x) => { x.current = x.title === title })
-  })
-  ctx.on('workflow/log', (info: WorkflowRunInfo, message: string) => {
-    const e = upsertRun(info)
-    e.logs.push({ at: Date.now(), message })
-    if (e.logs.length > 200) e.logs = e.logs.slice(-200)
-  })
-  ctx.on('workflow/agent-start', (info: WorkflowRunInfo, agent: WorkflowAgentInfo) => {
-    const e = upsertRun(info)
-    e.agents.push({ seq: agent.seq, label: agent.label, phase: agent.phase })
-    if (agent.phase) {
-      let p = e.phases.find((x) => x.title === agent.phase)
-      if (!p) {
-        p = { title: agent.phase, totalAgents: 0, doneAgents: 0, current: true }
-        e.phases.push(p)
-      }
-      p.totalAgents += 1
-    }
-  })
-  ctx.on('workflow/agent-end', (info: WorkflowRunInfo, agent: WorkflowAgentEndInfo) => {
-    const e = upsertRun(info)
-    const a = e.agents.find((x) => x.seq === agent.seq)
-    if (a) a.outcome = agent.outcome
-    if (agent.phase) {
-      const p = e.phases.find((x) => x.title === agent.phase)
-      if (p) p.doneAgents = Math.min(p.totalAgents, p.doneAgents + 1)
-    }
-  })
-  ctx.on('workflow/end', (info: WorkflowRunInfo, result: WorkflowResultInfo) => {
-    const e = upsertRun(info)
-    const reason = result?.stopReason ?? 'error'
-    e.status = reason === 'completed' ? 'completed' : reason === 'cancelled' ? 'cancelled' : 'error'
-    e.endedAt = Date.now()
-    e.result = { stopReason: reason, error: result?.error, agentsStarted: result?.agentsStarted ?? 0 }
-    e.phases.forEach((p) => { p.current = false; p.doneAgents = p.totalAgents })
-  })
-
-  // ---- snapshot (own plain JSON leaves only; never undefined) ----
-  const plain = (v: unknown) => (v === undefined ? null : v)
+  // ---- grouped snapshot: disk runs + registered placeholders ----
   const snapshot = () => {
+    const groupMap = loadGroupMap()
+    const byGroup = new Map<string, RunEntry[]>()
+
+    const push = (e: RunEntry) => {
+      const list = byGroup.get(e.group) ?? []
+      list.push(e)
+      byGroup.set(e.group, list)
+    }
+
+    for (const dir of runDirs()) {
+      const entries = readdirRuns(dir)
+      for (const sub of entries) {
+        const parsed = parseRunDir(sub, groupMap)
+        if (parsed) push(parsed)
+      }
+    }
+
+    for (const e of runs.values()) push(e)
+
+    // de-duplicate by run id (registered placeholder superseded by a disk run)
+    const deduped = new Map<string, RunEntry>()
+    for (const [group, entries] of byGroup) {
+      for (const e of entries) deduped.set(e.id, e)
+      const unique = [...deduped.values()].filter((e) => e.group === group)
+      byGroup.set(group, unique)
+    }
+
     const groupsOut: unknown[] = []
-    for (const g of groups.values()) {
+    for (const [group, entries] of [...byGroup.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
       groupsOut.push({
-        name: g.name,
-        createdAt: g.createdAt,
-        workflows: g.runIds
-          .map((id) => runs.get(id))
-          .filter((e): e is RunEntry => !!e)
+        name: group,
+        createdAt: groups.get(group)?.createdAt ?? Date.now(),
+        workflows: entries
+          .sort((a, b) => b.startedAt - a.startedAt)
           .map((e) => ({
             id: e.id,
             name: e.name,
             description: e.description,
             status: e.status,
             startedAt: e.startedAt,
-            endedAt: plain(e.endedAt),
+            endedAt: e.endedAt ?? null,
             phases: e.phases.map((p) => ({ title: p.title, totalAgents: p.totalAgents, doneAgents: p.doneAgents, current: p.current })),
             agents: e.agents.map((a) => ({ seq: a.seq, label: a.label, phase: a.phase ?? null, outcome: a.outcome ?? null })),
             logs: e.logs.slice(-60).map((l) => ({ at: l.at, message: l.message })),
@@ -234,7 +312,7 @@ export function apply(ctx: Context) {
   // ---- model tools ----
   ctx.tools.register({
     name: 'workflow_new',
-    description: '创建并立即启动一个新的分组工作流（workflow）。必须提供 group（分组名）、name、description 与 script（纯 JS 脚本体，允许 top-level await，以 return <json> 结尾）。脚本内可用 agent(prompt, opts) 派生子 agent、phase(title) 进入阶段、log(message) 输出日志。运行状态会实时显示在 GUI 的「工作流」标签页中，同分组的 workflow 显示在同一个独立面板。若当前环境无法直接启动引擎，将登记为「已登记」条目，随后请用 run_workflow 工具（source=script、meta 含同名 name）执行，事件流会自动关联回该分组。',
+    description: '创建并立即启动一个新的分组工作流（workflow）。必须提供 group（分组名）、name、description 与 script（纯 JS 脚本体，允许 top-level await，以 return <json> 结尾）。脚本内可用 agent(prompt, opts) 派生子 agent、phase(title) 进入阶段、log(message) 输出日志。运行状态会实时显示在 GUI 的「工作流」标签页中，同分组的 workflow 显示在同一个独立面板。若当前环境无法直接启动引擎，将登记为「已登记」条目。',
     parameters: {
       type: 'object',
       properties: {
@@ -252,14 +330,14 @@ export function apply(ctx: Context) {
         subagentProvider: { type: 'string', description: '可选：子 agent 提供者名称。' },
         maxTotalAgents: { type: 'number', description: '可选：本次运行子 agent 总数上限。' },
       },
+      // DSH JSON-Schema subset requires `required` at the OBJECT level as a
+      // string array — NOT `required: true` inside each property.
       required: ['group', 'name', 'description', 'script'],
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        // DSH JSON-Schema subset requires `required` at the OBJECT level as a
-        // string array — NOT `required: true` inside each property.
         properties: {
           id: { type: 'string' },
           group: { type: 'string' },
@@ -274,30 +352,42 @@ export function apply(ctx: Context) {
       const name = String(args.name ?? '')
       const group = String(args.group ?? '')
       const description = String(args.description ?? '')
-      const engine = (ctx as any).get?.('workflowEngine') as { start(req: any): { id: string } } | undefined
+      const script = String(args.script ?? '')
+      const engine = (ctx as any).get?.('dynamicWorkflows') as { startInline(agent: any, module: any, args?: unknown, signal?: any, source?: string, approvalGranted?: boolean): Promise<{ id: string }> } | undefined
       if (engine) {
         if (!exec?.agent) return { id: '', group, name, status: 'error: 缺少 agent 上下文' }
-        const meta: WorkflowMeta = { name, description }
-        if (args.whenToUse) meta.whenToUse = String(args.whenToUse)
-        if (Array.isArray(args.phases) && args.phases.length) {
-          meta.phases = args.phases.map((p: any) => ({
-            title: String(p.title),
-            detail: p.detail ? String(p.detail) : undefined,
-            provider: p.provider ? String(p.provider) : undefined,
-            model: p.model ? String(p.model) : undefined,
-          }))
+        const phaseTitles: string[] = Array.isArray(args.phases) ? args.phases.map((p: any) => String(p?.title ?? '')).filter(Boolean) : []
+        const manifest = {
+          name,
+          description,
+          phases: phaseTitles,
+          readOnly: false,
+          maxAgents: args.maxTotalAgents ? Number(args.maxTotalAgents) : 8,
+          maxConcurrency: 2,
+          patterns: ['classify-and-act'],
+          execution: 'capability-generated',
         }
-        const run = engine.start({
-          script: String(args.script),
-          meta,
-          args: args.args,
-          parent: exec.agent,
-          subagentProvider: args.subagentProvider ? String(args.subagentProvider) : undefined,
-          maxTotalAgents: args.maxTotalAgents ? Number(args.maxTotalAgents) : undefined,
-        })
-        const e = upsertRun({ id: run.id, meta }, { group, name, description })
-        e.status = 'running'
-        return { id: run.id, group: e.group, name: e.name, status: e.status }
+        try {
+          const run = await engine.startInline(
+            exec.agent,
+            { manifest, execution: 'capability-generated', source: script },
+            args.args,
+            undefined,
+            'inline',
+            true, // approvalGranted — the board owns workflow starts
+          )
+          const map = loadGroupMap()
+          map[String(run.id)] = group
+          saveGroupMap(map)
+          upsertRun(String(run.id), group, {
+            name, description, status: 'running', startedAt: Date.now(), phases: phaseTitles.map((title) => ({ title, totalAgents: 0, doneAgents: 0, current: false })), agents: [], logs: [],
+          })
+          const g = ensureGroup(group)
+          if (!g.runIds.includes(String(run.id))) g.runIds.push(String(run.id))
+          return { id: String(run.id), group, name, status: 'running' }
+        } catch (error) {
+          return { id: '', group, name, status: 'error: ' + (error instanceof Error ? error.message : String(error)) }
+        }
       }
       // engine not reachable: register a pending entry
       const id = `reg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -314,7 +404,6 @@ export function apply(ctx: Context) {
         startedAt: Date.now(),
       }
       runs.set(id, e)
-      byName.set(name, id)
       const g = ensureGroup(group)
       if (!g.runIds.includes(id)) g.runIds.push(id)
       return { id, group, name, status: 'registered' }
@@ -340,18 +429,28 @@ export function apply(ctx: Context) {
     postRoute(`${API_PREFIX}/clear`, async () => {
       groups.clear()
       runs.clear()
-      byName.clear()
+      saveGroupMap({})
       return { cleared: true }
     }),
   ]
   // Register routes for the fiber lifetime. ctx.effect(callback) treats the
   // callback's RETURN value as the disposer — so pass a thunk that registers
-  // and returns the cleanup, never the disposer itself (that would dispose
-  // immediately when the effect callback is the disposer).
+  // and returns the cleanup, never the disposer itself.
   ctx.effect(() => {
     const disposers = routes.map((route) => ctx.webServer.register(route))
     return () => {
       for (const dispose of disposers) dispose()
     }
   })
+}
+
+/** List immediate subdirectories of a run directory (each holds one run). */
+function readdirRuns(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => join(dir, d.name))
+  } catch {
+    return []
+  }
 }
