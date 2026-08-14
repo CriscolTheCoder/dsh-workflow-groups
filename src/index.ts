@@ -341,6 +341,14 @@ export function apply(ctx: Context) {
       return { cleared: true }
     }),
   ]
-  const disposers = routes.map((route) => ctx.webServer.register(route))
-  for (const dispose of disposers) ctx.effect(dispose)
+  // Register routes for the fiber lifetime. ctx.effect(callback) treats the
+  // callback's RETURN value as the disposer — so pass a thunk that registers
+  // and returns the cleanup, never the disposer itself (that would dispose
+  // immediately when the effect callback is the disposer).
+  ctx.effect(() => {
+    const disposers = routes.map((route) => ctx.webServer.register(route))
+    return () => {
+      for (const dispose of disposers) dispose()
+    }
+  })
 }
