@@ -39,13 +39,17 @@ await build({
 
 // Client half: build as CJS so the ModuleLoader wrapper can capture
 // module.exports; then rewrite the file to the __ModuleLoader__.load form.
+// `react` must stay EXTERNAL: the「工作流」board is a shell-rendered slot
+// component (conversation.view), so it must use the SHELL's React instance —
+// bundling a second React copy makes every hook crash with "Cannot read
+// properties of null (reading 'useState')" (dispatcher null).
 await build({
   bundle: true,
   platform: 'browser',
   format: 'cjs',
   target: 'es2022',
   define: { 'process.env.NODE_ENV': '"production"' },
-  external: [],
+  external: ['react'],
   entryPoints: [join(src, 'client.ts')],
   outfile: join(out, 'client.raw.js'),
   logLevel: 'info',
