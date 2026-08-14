@@ -45,7 +45,9 @@ const GROUP_MAP_PATH = join(process.env.DSH_HOME ?? homedir(), '.dsh', 'dsh-work
 
 function loadGroupMap(): Record<string, string> {
   try {
-    const parsed = JSON.parse(readFileSync(GROUP_MAP_PATH, 'utf8')) as Record<string, string>
+    // strip a UTF-8 BOM (PowerShell/记事本-written JSON) — JSON.parse rejects it
+    const text = readFileSync(GROUP_MAP_PATH, 'utf8').replace(/^\uFEFF/, '')
+    const parsed = JSON.parse(text) as Record<string, string>
     return typeof parsed === 'object' && parsed !== null ? parsed : {}
   } catch {
     return {}
