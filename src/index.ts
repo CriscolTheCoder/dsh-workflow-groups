@@ -323,7 +323,7 @@ export function apply(ctx: Context) {
     description: '列出当前按组归类的 workflow 运行状态（只读）：每个分组的独立面板内容，包括每个 workflow 的状态、阶段进度、子 agent 明细与最近日志。用于查看 GUI「工作流」标签页背后的数据。',
     parameters: { type: 'object', properties: {} },
     output: {
-      schema: { type: 'json' },
+      schema: { type: 'object', additionalProperties: true },
       render: (args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute() {

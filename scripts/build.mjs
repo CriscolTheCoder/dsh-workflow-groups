@@ -1,11 +1,16 @@
 /**
  * Build script: bundles the host half (src/index.ts) and the client half
- * (src/client.ts) into standalone ESM files under lib/, plus type
- * declarations. Uses esbuild when available, falling back to plain text
- * copy for the .d.ts stubs.
+ * (src/client.ts) into standalone ESM/CJS files under lib/.
+ *
+ * - lib/index.js  — host half: plain ESM (cordis plugin exports name/inject/apply).
+ * - lib/client.js — browser half: wrapped in window.__ModuleLoader__.load({ id,
+ *   factory }) — the DSH client module system REQUIRES this wrapper for every
+ *   dsh.client bundle (see dsh-pet / dsh-ssh / dsh-web-terminal). The wrapper
+ *   is injected at build time so build AND future rebuilds stay correct.
  */
 import { build } from 'esbuild'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -15,36 +20,48 @@ const out = join(root, '..', 'lib')
 
 mkdirSync(out, { recursive: true })
 
-const common = {
+const hostExternal = [
+  '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-workflow',
+]
+
+await build({
   bundle: true,
   platform: 'node',
   format: 'esm',
   target: 'node22',
   sourcemap: true,
-  external: [
-    '@deepseek-ai/cordis',
-    '@deepseek-ai/dsh-workflow',
-    '@deepseek-ai/dsh-client-runtime',
-    '@deepseek-ai/dsh-client-ui-slots',
-    'react',
-  ],
-  logLevel: 'info',
-}
-
-await build({
-  ...common,
+  external: hostExternal,
   entryPoints: [join(src, 'index.ts')],
   outfile: join(out, 'index.js'),
+  logLevel: 'info',
 })
 
+// Client half: build as CJS so the ModuleLoader wrapper can capture
+// module.exports; then rewrite the file to the __ModuleLoader__.load form.
 await build({
-  ...common,
+  bundle: true,
   platform: 'browser',
-  format: 'esm',
+  format: 'cjs',
   target: 'es2022',
+  define: { 'process.env.NODE_ENV': '"production"' },
+  external: [],
   entryPoints: [join(src, 'client.ts')],
-  outfile: join(out, 'client.js'),
+  outfile: join(out, 'client.raw.js'),
+  logLevel: 'info',
 })
+
+const raw = readFileSync(join(out, 'client.raw.js'), 'utf8')
+const wrapped = `window.__ModuleLoader__.load({
+	id: "dsh-workflow-groups",
+	factory: (require) => {
+		${raw}
+		return module.exports;
+	}
+});
+`
+writeFileSync(join(out, 'client.js'), wrapped)
+try { await unlink(join(out, 'client.raw.js')) } catch { /* already gone */ }
 
 // minimal type stubs so TS consumers can import the package
 writeFileSync(join(out, 'index.d.ts'), 'export declare const name: string\nexport declare const inject: string[]\nexport declare function apply(ctx: any): void\n')
