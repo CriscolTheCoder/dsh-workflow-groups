@@ -52,9 +52,14 @@ await build({
 })
 
 const raw = readFileSync(join(out, 'client.raw.js'), 'utf8')
+// The DSH __ModuleLoader__.load factory receives `require` but NOT `module` /
+// `exports`. esbuild's CJS output assigns `module.exports = ...`, so both must
+// be injected at the top of the factory (same approach as dsh-web-terminal's
+// wrapClientPlugin) or the browser throws `module is not defined`.
 const wrapped = `window.__ModuleLoader__.load({
 	id: "dsh-workflow-groups",
 	factory: (require) => {
+		var module = { exports: {} }; var exports = module.exports;
 		${raw}
 		return module.exports;
 	}
